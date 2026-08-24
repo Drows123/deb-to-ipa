@@ -1,0 +1,89 @@
+name: GP2040 custom firmware PR build
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout temporary build branch
+        uses: actions/checkout@v4.2.2
+        with:
+          path: helper
+
+      - name: Checkout GP2040-CE v0.7.12
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: OpenStickCommunity/GP2040-CE
+          ref: v0.7.12
+          fetch-depth: 0
+          path: gp2040
+
+      - name: Patch firmware
+        working-directory: gp2040
+        run: |
+          python3 ../helper/tools/gp2040_fps_patch.py
+          grep -n 'CFG_TUH_HID' headers/tusb_config.h
+          grep -n 'FPS_MIN_OUTPUT\|FPS_CURVE_GAMMA\|FPS_AIM_PERIOD_US' src/addons/keyboard_host_listener.cpp
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '20.x'
+          cache: npm
+          cache-dependency-path: gp2040/www/package-lock.json
+
+      - name: Build Web Config data
+        working-directory: gp2040/www
+        run: |
+          npm ci
+          CI=false npm run build --if-present
+
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.17.x'
+
+      - name: Setup Raspberry Pi Pico SDK/toolchain
+        uses: Fortinbra/RaspberryPiPicoBuild@v7
+        with:
+          path: gp2040
+
+      - name: Configure firmware
+        working-directory: gp2040
+        shell: bash
+        run: |
+          PICO_SDK_PATH=${{ github.workspace }}/gp2040/pico-sdk \
+          GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
+          SKIP_WEBBUILD=TRUE \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build firmware
+        working-directory: gp2040
+        shell: bash
+        run: |
+          GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
+          cmake --build build --config Release --parallel 2
+
+      - name: Stage custom UF2
+        working-directory: gp2040
+        shell: bash
+        run: |
+          src=$(find build -maxdepth 1 -name 'GP2040-CE_*_RP2040AdvancedBreakoutBoardUSBPassthrough.uf2' -print -quit)
+          test -n "$src"
+          cp "$src" GP2040-CE_0.7.12_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+          ls -lh GP2040-CE_0.7.12_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+
+      - name: Upload custom firmware
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: gp2040-hid8-fps-firmware
+          path: gp2040/GP2040-CE_0.7.12_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+          if-no-files-found: error
