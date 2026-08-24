@@ -1,0 +1,143 @@
+name: Temporary GP2040 FPS firmware build
+
+on:
+  push:
+    branches:
+      - tmp-gp2040-fps-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout GP2040-CE v0.7.12
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: OpenStickCommunity/GP2040-CE
+          ref: v0.7.12
+          fetch-depth: 0
+
+      - name: Patch USB host and FPS mouse curve
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          tusb = Path('headers/tusb_config.h')
+          text = tusb.read_text()
+          old = '#define CFG_TUH_HID 4'
+          assert old in text, 'CFG_TUH_HID definition not found'
+          tusb.write_text(text.replace(old, '#define CFG_TUH_HID 8', 1))
+
+          header = Path('headers/addons/keyboard_host_listener.h')
+          h = header.read_text()
+          old = '''    uint8_t getKeycodeFromModifier(uint8_t modifier);\n    void preprocess_report();\n    void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *report);\n    void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const *report);\n    uint16_t scaleMouseToJoystick(int8_t mouseVal);\n'''
+          new = '''    uint8_t getKeycodeFromModifier(uint8_t modifier);\n    void resetKeyboardState();\n    void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *report);\n    void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const *report);\n    void updateFpsAim();\n    float smoothMouseDelta(int32_t delta, float &previous);\n    float shapeMousePercent(float delta, bool adsActive) const;\n    uint16_t percentToJoystick(float signedPercent) const;\n'''
+          assert old in h, 'keyboard host method declarations not found'
+          h = h.replace(old, new, 1)
+          old = '    GamepadState _keyboard_host_state;\n'
+          new = '    GamepadState _keyboard_host_state;\n    GamepadState _mouse_host_state;\n'
+          assert old in h, 'keyboard state member not found'
+          h = h.replace(old, new, 1)
+          old = '    bool mouseActive;\n'
+          new = '''    bool mouseActive;\n    int32_t mouseAccumX;\n    int32_t mouseAccumY;\n    float smoothMouseX;\n    float smoothMouseY;\n    bool mouseRightHeld;\n    uint32_t nextAimUpdateUs;\n'''
+          assert old in h, 'mouseActive member not found'
+          h = h.replace(old, new, 1)
+          header.write_text(h)
+
+          source = Path('src/addons/keyboard_host_listener.cpp')
+          s = source.read_text()
+          s = s.replace('#include <algorithm>\n', '#include <algorithm>\n#include <cmath>\n#include "pico/time.h"\n', 1)
+          marker = '#define GAMEPAD_JOYSTICK_MAX_I32 static_cast<int32_t>(GAMEPAD_JOYSTICK_MAX)\n'
+          constants = '''#define GAMEPAD_JOYSTICK_MAX_I32 static_cast<int32_t>(GAMEPAD_JOYSTICK_MAX)\n\nnamespace {\nconstexpr float FPS_MIN_OUTPUT = 9.0f;\nconstexpr float FPS_CURVE_GAMMA = 1.6f;\nconstexpr float FPS_SMOOTHING_KEEP = 0.25f;\nconstexpr float FPS_ADS_MULTIPLIER = 0.40f;\nconstexpr uint32_t FPS_AIM_PERIOD_US = 8333; // ~120 Hz, matching the NUXBT test script\n}\n'''
+          assert marker in s, 'joystick constant marker not found'
+          s = s.replace(marker, constants, 1)
+
+          old = '''  mouseX = 0;\n  mouseY = 0;\n  mouseZ = 0;\n  mouseActive = false;\n}\n'''
+          new = '''  mouseX = 0;\n  mouseY = 0;\n  mouseZ = 0;\n  mouseActive = false;\n  mouseAccumX = 0;\n  mouseAccumY = 0;\n  smoothMouseX = 0.0f;\n  smoothMouseY = 0.0f;\n  mouseRightHeld = false;\n  nextAimUpdateUs = time_us_32() + FPS_AIM_PERIOD_US;\n\n  _keyboard_host_state = GamepadState{};\n  _mouse_host_state = GamepadState{};\n}\n'''
+          assert old in s, 'setup tail not found'
+          s = s.replace(old, new, 1)
+
+          start = s.index('void KeyboardHostListener::process() {')
+          end = s.index('void KeyboardHostListener::mount(', start)
+          process_impl = '''void KeyboardHostListener::process() {\n  Gamepad *gamepad = Storage::getInstance().GetGamepad();\n\n  // Keep keyboard and mouse HID state independent. Composite devices and hub\n  // traffic can otherwise cause a mouse report to wipe held keyboard state.\n  if (_keyboard_host_mounted == true) {\n    gamepad->state.dpad    |= _keyboard_host_state.dpad;\n    gamepad->state.buttons |= _keyboard_host_state.buttons;\n    if (!gamepad->hasAnalogTriggers) {\n      gamepad->state.lt |= _keyboard_host_state.lt;\n      gamepad->state.rt |= _keyboard_host_state.rt;\n    }\n  }\n\n  if (_mouse_host_mounted == true) {\n    updateFpsAim();\n    gamepad->state.buttons |= _mouse_host_state.buttons;\n    if (!gamepad->hasAnalogTriggers) {\n      gamepad->state.lt |= _mouse_host_state.lt;\n      gamepad->state.rt |= _mouse_host_state.rt;\n    }\n\n    if (mouseMovementMode == MOUSE_MOVEMENT_LEFT_ANALOG) {\n      gamepad->state.lx = _mouse_host_state.lx;\n      gamepad->state.ly = _mouse_host_state.ly;\n    } else if (mouseMovementMode == MOUSE_MOVEMENT_RIGHT_ANALOG) {\n      gamepad->state.rx = _mouse_host_state.rx;\n      gamepad->state.ry = _mouse_host_state.ry;\n    }\n\n    gamepad->auxState.sensors.mouse.active = mouseActive;\n    if (mouseActive == true) {\n      gamepad->auxState.sensors.mouse.enabled = true;\n      gamepad->auxState.sensors.mouse.x = mouseX;\n      gamepad->auxState.sensors.mouse.y = mouseY;\n      gamepad->auxState.sensors.mouse.z = mouseZ;\n      mouseActive = false;\n    }\n  }\n}\n\n'''
+          s = s[:start] + process_impl + s[end:]
+
+          # A combo receiver can expose keyboard and mouse interfaces under one USB\n          # device address, so clear both independently on unmount.\n          old = '''void KeyboardHostListener::unmount(uint8_t dev_addr) {\n    if ( _keyboard_host_mounted == true && _keyboard_dev_addr == dev_addr ) {\n        _keyboard_host_mounted = false;\n        _keyboard_dev_addr = DEV_ADDR_NONE;\n        _keyboard_instance = 0;\n    } else if ( _mouse_host_mounted == true && _mouse_dev_addr == dev_addr ) {\n        Gamepad *gamepad = Storage::getInstance().GetGamepad();\n        gamepad->auxState.sensors.mouse.enabled = false;\n        _mouse_host_mounted = false;\n        _mouse_dev_addr = DEV_ADDR_NONE;\n        _mouse_instance = 0;\n    }\n}\n'''
+          new = '''void KeyboardHostListener::unmount(uint8_t dev_addr) {\n    if ( _keyboard_host_mounted == true && _keyboard_dev_addr == dev_addr ) {\n        _keyboard_host_mounted = false;\n        _keyboard_dev_addr = DEV_ADDR_NONE;\n        _keyboard_instance = 0;\n        _keyboard_host_state = GamepadState{};\n    }\n    if ( _mouse_host_mounted == true && _mouse_dev_addr == dev_addr ) {\n        Gamepad *gamepad = Storage::getInstance().GetGamepad();\n        gamepad->auxState.sensors.mouse.enabled = false;\n        _mouse_host_mounted = false;\n        _mouse_dev_addr = DEV_ADDR_NONE;\n        _mouse_instance = 0;\n        _mouse_host_state = GamepadState{};\n        mouseAccumX = 0;\n        mouseAccumY = 0;\n        smoothMouseX = 0.0f;\n        smoothMouseY = 0.0f;\n        mouseRightHeld = false;\n    }\n}\n'''
+          assert old in s, 'unmount implementation not found'
+          s = s.replace(old, new, 1)
+
+          start = s.index('void KeyboardHostListener::preprocess_report()')
+          end = s.index('// convert hid keycode', start)
+          reset_impl = '''void KeyboardHostListener::resetKeyboardState()\n{\n  _keyboard_host_state.dpad = 0;\n  _keyboard_host_state.buttons = 0;\n  _keyboard_host_state.lt = 0;\n  _keyboard_host_state.rt = 0;\n}\n\n'''
+          s = s[:start] + reset_impl + s[end:]
+          old = '  preprocess_report();\n\n  // make this 13 instead of 7'
+          new = '  resetKeyboardState();\n\n  // make this 13 instead of 7'
+          assert old in s, 'keyboard preprocess call not found'
+          s = s.replace(old, new, 1)
+
+          start = s.index('uint16_t KeyboardHostListener::scaleMouseToJoystick(')
+          replacement = r'''float KeyboardHostListener::smoothMouseDelta(int32_t delta, float &previous) {\n  if (delta == 0) {\n    previous = 0.0f;\n    return 0.0f;\n  }\n  const float currentWeight = 1.0f - FPS_SMOOTHING_KEEP;\n  previous = currentWeight * static_cast<float>(delta) + FPS_SMOOTHING_KEEP * previous;\n  return previous;\n}\n\nfloat KeyboardHostListener::shapeMousePercent(float delta, bool adsActive) const {\n  if (std::fabs(delta) < 1.0e-6f) {\n    return 0.0f;\n  }\n\n  // mouseSensitivityScale is the existing Web Config value / 10.\n  // Set Mouse Sensitivity to 30 to reproduce the NUXBT sensitivity 3.0.\n  const float linearPercent = std::min(100.0f, std::fabs(delta) * mouseSensitivityScale);\n  const float normalized = linearPercent / 100.0f;\n  const float curved = std::pow(normalized, FPS_CURVE_GAMMA);\n\n  float magnitude = FPS_MIN_OUTPUT + (100.0f - FPS_MIN_OUTPUT) * curved;\n  if (adsActive) {\n    magnitude = FPS_MIN_OUTPUT + (magnitude - FPS_MIN_OUTPUT) * FPS_ADS_MULTIPLIER;\n  }\n  magnitude = std::clamp(magnitude, FPS_MIN_OUTPUT, 100.0f);\n  magnitude = std::round(magnitude);\n  return delta > 0.0f ? magnitude : -magnitude;\n}\n\nuint16_t KeyboardHostListener::percentToJoystick(float signedPercent) const {\n  const float clamped = std::clamp(signedPercent, -100.0f, 100.0f);\n  const int32_t percent = static_cast<int32_t>(std::round(std::fabs(clamped)));\n  int32_t result = joystickMid;\n  if (clamped > 0.0f) {\n    const int32_t span = GAMEPAD_JOYSTICK_MAX_I32 - joystickMid;\n    result += (span * percent + 50) / 100;\n  } else if (clamped < 0.0f) {\n    const int32_t span = joystickMid - GAMEPAD_JOYSTICK_MIN_I32;\n    result -= (span * percent + 50) / 100;\n  }\n  return static_cast<uint16_t>(std::clamp(result, GAMEPAD_JOYSTICK_MIN_I32, GAMEPAD_JOYSTICK_MAX_I32));\n}\n\nvoid KeyboardHostListener::updateFpsAim() {\n  if (mouseMovementMode == MOUSE_MOVEMENT_NONE) {\n    return;\n  }\n\n  const uint32_t now = time_us_32();\n  if (static_cast<int32_t>(now - nextAimUpdateUs) < 0) {\n    return;\n  }\n\n  // Keep a stable ~120 Hz cadence, but recover if the loop was stalled.\n  nextAimUpdateUs += FPS_AIM_PERIOD_US;\n  if (static_cast<int32_t>(now - nextAimUpdateUs) > static_cast<int32_t>(FPS_AIM_PERIOD_US * 4)) {\n    nextAimUpdateUs = now + FPS_AIM_PERIOD_US;\n  }\n\n  const int32_t dx = mouseAccumX;\n  const int32_t dy = mouseAccumY;\n  mouseAccumX = 0;\n  mouseAccumY = 0;\n\n  const float smoothX = smoothMouseDelta(dx, smoothMouseX);\n  const float smoothY = smoothMouseDelta(dy, smoothMouseY);\n  const float adsScale = mouseRightHeld ? FPS_ADS_MULTIPLIER : 1.0f;\n\n  // shapeMousePercent applies ADS internally. adsScale is represented by the\n  // boolean here to preserve the Python rule that the 9% floor is never scaled.\n  const bool adsActive = adsScale < 1.0f;\n  const float xPercent = shapeMousePercent(smoothX, adsActive);\n  const float yPercent = shapeMousePercent(smoothY, adsActive);\n\n  if (mouseMovementMode == MOUSE_MOVEMENT_LEFT_ANALOG) {\n    _mouse_host_state.lx = percentToJoystick(xPercent);\n    _mouse_host_state.ly = percentToJoystick(yPercent);\n  } else if (mouseMovementMode == MOUSE_MOVEMENT_RIGHT_ANALOG) {\n    _mouse_host_state.rx = percentToJoystick(xPercent);\n    _mouse_host_state.ry = percentToJoystick(yPercent);\n  }\n}\n\nvoid KeyboardHostListener::process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * report)\n{\n  _mouse_host_state.buttons = 0;\n  _mouse_host_state.lt = 0;\n  _mouse_host_state.rt = 0;\n\n  _mouse_host_state.buttons |=\n      (report->buttons & MOUSE_BUTTON_LEFT   ?   mouseLeftMapping : 0)\n    | (report->buttons & MOUSE_BUTTON_MIDDLE ? mouseMiddleMapping : 0)\n    | (report->buttons & MOUSE_BUTTON_RIGHT  ?  mouseRightMapping : 0);\n\n  mouseRightHeld = (report->buttons & MOUSE_BUTTON_RIGHT) != 0;\n\n  mouseX = report->x;\n  mouseY = report->y;\n  mouseZ = report->wheel;\n  mouseActive = true;\n\n  if (mouseMovementMode != MOUSE_MOVEMENT_NONE) {\n    mouseAccumX += static_cast<int32_t>(report->x);\n    mouseAccumY += static_cast<int32_t>(report->y);\n  }\n}\n'''
+          # replacement is raw to make workflow construction readable; turn escaped newlines into real ones.
+          replacement = replacement.replace('\\n', '\n')
+          s = s[:start] + replacement
+          source.write_text(s)
+
+          print('Patched CFG_TUH_HID=8 and FPS mouse shaping.')
+          PY
+
+          grep -n "CFG_TUH_HID" headers/tusb_config.h
+          grep -n "FPS_MIN_OUTPUT\|FPS_CURVE_GAMMA\|FPS_AIM_PERIOD_US" src/addons/keyboard_host_listener.cpp
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '20.x'
+          cache: npm
+          cache-dependency-path: www/package-lock.json
+
+      - name: Build Web Config data
+        working-directory: www
+        run: |
+          npm ci
+          CI=false npm run build --if-present
+
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.17.x'
+
+      - name: Setup Raspberry Pi Pico SDK/toolchain
+        uses: Fortinbra/RaspberryPiPicoBuild@v7
+
+      - name: Configure firmware
+        shell: bash
+        run: |
+          PICO_SDK_PATH=${{ github.workspace }}/pico-sdk \
+          GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
+          SKIP_WEBBUILD=TRUE \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
+          cmake --build build --config Release --parallel 2
+
+      - name: Stage custom UF2
+        shell: bash
+        run: |
+          src=$(find build -maxdepth 1 -name 'GP2040-CE_*_RP2040AdvancedBreakoutBoardUSBPassthrough.uf2' -print -quit)
+          test -n "$src"
+          cp "$src" GP2040-CE_0.7.12_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+          ls -lh GP2040-CE_0.7.12_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+
+      - name: Upload custom firmware
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: gp2040-hid8-fps-firmware
+          path: GP2040-CE_0.7.12_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+          if-no-files-found: error
