@@ -53,14 +53,12 @@ jobs:
 
       - name: Setup Raspberry Pi Pico SDK/toolchain
         uses: Fortinbra/RaspberryPiPicoBuild@v7
-        with:
-          path: gp2040
 
       - name: Configure firmware
         working-directory: gp2040
         shell: bash
         run: |
-          PICO_SDK_PATH=${{ github.workspace }}/gp2040/pico-sdk \
+          PICO_SDK_PATH=${{ github.workspace }}/pico-sdk \
           GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
           SKIP_WEBBUILD=TRUE \
           cmake -B build -DCMAKE_BUILD_TYPE=Release
