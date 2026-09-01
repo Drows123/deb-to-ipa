@@ -1,0 +1,103 @@
+name: GP2040 FPS tunable Web Config firmware build
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout helper branch
+        uses: actions/checkout@v4.2.2
+        with:
+          path: helper
+
+      - name: Checkout GP2040-CE pinned main
+        uses: actions/checkout@v6.0.1
+        with:
+          repository: OpenStickCommunity/GP2040-CE
+          ref: b136ec9250c2fd2f9734467c3a3872378aa29f62
+          fetch-depth: 0
+          submodules: recursive
+          path: gp2040
+
+      - name: Patch custom firmware
+        working-directory: gp2040
+        run: |
+          python3 ../helper/tools/gp2040_main_fps_patch.py
+          python3 ../helper/tools/gp2040_fps_webconfig_patch.py
+          grep -n 'CFG_TUH_HID' headers/tusb_config.h
+          grep -n 'PICO_USE_FASTEST_SUPPORTED_CLOCK' CMakeLists.txt
+          grep -n 'mouseMinOutput\|mouseGamma\|mouseSmoothing\|mouseAdsMultiplier' proto/config.proto src/addons/keyboard_host_listener.cpp | head -30
+          grep -n 'FPS Anti-Deadzone\|FPS Response Gamma\|FPS Smoothing\|FPS ADS Multiplier' www/src/Addons/Keyboard.tsx
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '20.x'
+          cache: npm
+          cache-dependency-path: gp2040/www/package-lock.json
+
+      - name: Build Web Config
+        working-directory: gp2040/www
+        run: |
+          npm ci
+          CI=false npm run build --if-present
+
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.x'
+
+      - name: Setup ARM GCC
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+
+      - name: Checkout Pico SDK 2.2.0
+        uses: actions/checkout@v6.0.1
+        with:
+          repository: raspberrypi/pico-sdk
+          ref: 2.2.0
+          path: pico-sdk
+
+      - name: Checkout Pico SDK submodules
+        working-directory: pico-sdk
+        run: git submodule update --init
+
+      - name: Configure firmware
+        working-directory: gp2040
+        shell: bash
+        run: |
+          PICO_SDK_PATH=${{ github.workspace }}/pico-sdk \
+          GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
+          SKIP_WEBBUILD=TRUE \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build firmware
+        working-directory: gp2040
+        shell: bash
+        run: |
+          GP2040_BOARDCONFIG=RP2040AdvancedBreakoutBoardUSBPassthrough \
+          cmake --build build --config Release --parallel 2
+
+      - name: Stage UF2
+        working-directory: gp2040
+        shell: bash
+        run: |
+          src=$(find build -maxdepth 1 -name 'GP2040-CE_*_RP2040AdvancedBreakoutBoardUSBPassthrough.uf2' -print -quit)
+          test -n "$src"
+          cp "$src" GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
+          sha256sum GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
+          ls -lh GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: gp2040-main-hid8-fps-tunable-firmware
+          path: gp2040/GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
+          if-no-files-found: error
