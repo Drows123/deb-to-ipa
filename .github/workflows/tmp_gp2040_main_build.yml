@@ -1,4 +1,4 @@
-name: GP2040 main custom firmware build
+name: GP2040 FPS tunable Web Config firmware build
 
 on:
   pull_request:
@@ -31,9 +31,11 @@ jobs:
         working-directory: gp2040
         run: |
           python3 ../helper/tools/gp2040_main_fps_patch.py
+          python3 ../helper/tools/gp2040_fps_webconfig_patch.py
           grep -n 'CFG_TUH_HID' headers/tusb_config.h
           grep -n 'PICO_USE_FASTEST_SUPPORTED_CLOCK' CMakeLists.txt
-          grep -n 'FPS_MIN_OUTPUT\|FPS_CURVE_GAMMA\|FPS_AIM_PERIOD_US' src/addons/keyboard_host_listener.cpp
+          grep -n 'mouseMinOutput\|mouseGamma\|mouseSmoothing\|mouseAdsMultiplier' proto/config.proto src/addons/keyboard_host_listener.cpp | head -30
+          grep -n 'FPS Anti-Deadzone\|FPS Response Gamma\|FPS Smoothing\|FPS ADS Multiplier' www/src/Addons/Keyboard.tsx
 
       - name: Use Node.js
         uses: actions/setup-node@v4.4.0
@@ -89,13 +91,13 @@ jobs:
         run: |
           src=$(find build -maxdepth 1 -name 'GP2040-CE_*_RP2040AdvancedBreakoutBoardUSBPassthrough.uf2' -print -quit)
           test -n "$src"
-          cp "$src" GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
-          sha256sum GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
-          ls -lh GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+          cp "$src" GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
+          sha256sum GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
+          ls -lh GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: gp2040-main-hid8-fps-firmware
-          path: gp2040/GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS.uf2
+          name: gp2040-main-hid8-fps-tunable-firmware
+          path: gp2040/GP2040-CE_MAIN_20260816_RP2040AdvancedBreakoutBoardUSBPassthrough_HID8_FPS_TUNABLE.uf2
           if-no-files-found: error
